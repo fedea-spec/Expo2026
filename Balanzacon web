@@ -1,0 +1,463 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include "Adafruit_HX711.h"
+#include <ESP32Servo.h>
+#include <math.h>
+
+// =====================================================
+// COMEDERO INTELIGENTE - UN SOLO ESP32
+// ESP32 clasico (ESP32-WROOM-32 / ESP32 Dev Module)
+// HX711 + celda de carga + RFID RC522 + servomotor
+// El mismo ESP32 crea la red Wi-Fi y aloja la pagina web.
+// =====================================================
+
+// ---------------- WIFI: PUNTO DE ACCESO ----------------
+const char* ssid = "ESP32_PROYECTO";
+const char* password = "12345678";
+
+WebServer server(80);
+
+// ---------------- HX711 ----------------
+#define HX711_DATA 4
+#define HX711_SCK  5
+Adafruit_HX711 hx711(HX711_DATA, HX711_SCK);
+
+const float FACTOR_CALIBRACION = 138.5f; // RAW por gramo
+int32_t offsetTara = 0;
+float pesoActual = 0.0f;       // gramos, peso estable
+float pesoFiltrado = 0.0f;
+bool filtroIniciado = false;
+const float ALFA_FILTRO = 0.35f;
+const float UMBRAL_CAMBIO_G = 1.5f;
+const float UMBRAL_CERO_G = 4.0f;
+const unsigned long INTERVALO_PESO = 50;
+unsigned long ultimoPeso = 0;
+bool primerPesoMostrado = false;
+float pesoMostradoAnterior = 999999.0f;
+void imprimirPeso(int32_t raw);
+
+// ---------------- RFID RC522 ----------------
+#define RFID_SS   21
+#define RFID_RST  22
+#define RFID_SCK  18
+#define RFID_MISO 19
+#define RFID_MOSI 23
+MFRC522 rfid(RFID_SS, RFID_RST);
+String uidDetectado = "";
+bool comiendo = false;
+unsigned long ultimaDeteccionRFID = 0;
+const unsigned long TIEMPO_SIN_RFID = 3000;
+
+// ---------------- SERVOMOTOR / COMPUERTA ----------------
+#define SERVO_PIN 13
+Servo servoCompuerta;
+const int ANGULO_CERRADO = 18;   // Ajustar segun la mecanica real
+const int ANGULO_ABIERTO = 82;   // Ajustar segun la mecanica real
+const float LIMITE_ABRIR_G = 500.0f;
+const float LIMITE_CERRAR_G = 550.0f; // Histeresis para evitar oscilaciones
+const unsigned long TIEMPO_BAJO_LIMITE = 4000; // 4 segundos
+bool compuertaAbierta = false;
+bool contandoPesoBajo = false;
+unsigned long inicioPesoBajo = 0;
+
+// =====================================================
+// RFID
+// =====================================================
+String obtenerUID()
+{
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++)
+  {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+void leerRFID()
+{
+  byte bufferATQA[2];
+  byte bufferSize = sizeof(bufferATQA);
+  MFRC522::StatusCode estado = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
+  if (estado != MFRC522::STATUS_OK && estado != MFRC522::STATUS_COLLISION) return;
+  if (!rfid.PICC_ReadCardSerial()) return;
+
+  String uidNuevo = obtenerUID();
+  if (uidNuevo != uidDetectado)
+  {
+    uidDetectado = uidNuevo;
+    Serial.print("RFID detectado: ");
+    Serial.println(uidDetectado);
+  }
+
+  if (!comiendo)
+  {
+    comiendo = true;
+    Serial.println("Estado: COMIENDO");
+  }
+
+  ultimaDeteccionRFID = millis();
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+// =====================================================
+// PESO FILTRADO
+// =====================================================
+void imprimirPeso(int32_t raw)
+{
+  pesoMostradoAnterior = pesoActual;
+  Serial.print("Peso estable: ");
+  Serial.print(pesoActual, 2);
+  Serial.print(" g | ");
+  Serial.print(pesoActual / 1000.0f, 3);
+  Serial.print(" kg | RAW: ");
+  Serial.println(raw);
+}
+
+void leerPeso()
+{
+  int32_t raw = hx711.readChannelRaw(CHAN_A_GAIN_128);
+  float pesoNuevo = (float)(raw - offsetTara) / FACTOR_CALIBRACION;
+
+  if (fabsf(pesoNuevo) < UMBRAL_CERO_G)
+    pesoNuevo = 0.0f;
+
+  if (!filtroIniciado)
+  {
+    pesoFiltrado = pesoNuevo;
+    pesoActual = pesoFiltrado;
+    filtroIniciado = true;
+  }
+  else
+  {
+    pesoFiltrado += ALFA_FILTRO * (pesoNuevo - pesoFiltrado);
+    if (fabsf(pesoFiltrado) < 0.8f)
+      pesoFiltrado = 0.0f;
+
+    // Banda muerta: cambios de 1 g o menos no alteran el peso estable.
+    if (fabsf(pesoFiltrado - pesoActual) > UMBRAL_CAMBIO_G)
+      pesoActual = pesoFiltrado;
+  }
+
+  if (!primerPesoMostrado)
+  {
+    primerPesoMostrado = true;
+    imprimirPeso(raw);
+  }
+  else if (fabsf(pesoActual - pesoMostradoAnterior) > UMBRAL_CAMBIO_G)
+  {
+    imprimirPeso(raw);
+  }
+}
+
+// =====================================================
+// CONTROL DE LA COMPUERTA
+// Abre si peso < 500 g durante 4 segundos continuos.
+// Cierra cuando el peso llega a 550 g o mas.
+// =====================================================
+void controlarCompuerta()
+{
+  unsigned long ahora = millis();
+
+  if (!compuertaAbierta)
+  {
+    if (pesoActual < LIMITE_ABRIR_G)
+    {
+      if (!contandoPesoBajo)
+      {
+        contandoPesoBajo = true;
+        inicioPesoBajo = ahora;
+        Serial.println("Peso inferior a 500 g; iniciando espera de 4 segundos...");
+      }
+      else if (ahora - inicioPesoBajo >= TIEMPO_BAJO_LIMITE)
+      {
+        servoCompuerta.write(ANGULO_ABIERTO);
+        compuertaAbierta = true;
+        contandoPesoBajo = false;
+        Serial.println("COMPUERTA ABIERTA: peso bajo durante 4 segundos.");
+      }
+    }
+    else
+    {
+      if (contandoPesoBajo)
+        Serial.println("Peso recuperado antes de 4 segundos; conteo cancelado.");
+      contandoPesoBajo = false;
+    }
+  }
+  else
+  {
+    if (pesoActual >= LIMITE_CERRAR_G)
+    {
+      servoCompuerta.write(ANGULO_CERRADO);
+      compuertaAbierta = false;
+      contandoPesoBajo = false;
+      Serial.println("COMPUERTA CERRADA: alimento recuperado hasta 550 g.");
+    }
+  }
+}
+
+// =====================================================
+// API LOCAL: ENVIAR DATOS A LA PAGINA WEB
+// =====================================================
+void enviarEstado()
+{
+  bool animalPresente = comiendo;
+
+  unsigned long segundosRestantes = 0;
+  if (!compuertaAbierta && contandoPesoBajo)
+  {
+    unsigned long transcurrido = millis() - inicioPesoBajo;
+    if (transcurrido < TIEMPO_BAJO_LIMITE)
+      segundosRestantes = (TIEMPO_BAJO_LIMITE - transcurrido + 999) / 1000;
+  }
+
+  String json;
+  json.reserve(220);
+  json = "{";
+  json += "\"uid\":\"" + uidDetectado + "\",";
+  json += "\"comiendo\":";
+  json += (animalPresente ? "true" : "false");
+  json += ",\"peso_g\":" + String(pesoActual, 2);
+  json += ",\"peso_kg\":" + String(pesoActual / 1000.0f, 2);
+  json += ",\"compuerta_abierta\":";
+  json += (compuertaAbierta ? "true" : "false");
+  json += ",\"contando_peso_bajo\":";
+  json += (contandoPesoBajo ? "true" : "false");
+  json += ",\"segundos_restantes\":" + String(segundosRestantes);
+  json += "}";
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+// =====================================================
+// PAGINA WEB
+// =====================================================
+const char paginaWeb[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#172a3a">
+  <title>Comedero inteligente</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 22px;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #edf2f5; color: #1d2935;
+    }
+    main { max-width: 760px; margin: 0 auto; }
+    header { text-align: center; margin: 8px 0 22px; }
+    h1 { font-size: clamp(24px, 5vw, 34px); margin: 0 0 8px; }
+    .subtitulo { color: #627282; font-size: 14px; }
+    .rejilla {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+    }
+    .tarjeta {
+      background: #fff; border-radius: 16px; padding: 22px;
+      box-shadow: 0 4px 14px rgba(24, 43, 58, .08);
+    }
+    .etiqueta { color: #667787; font-size: 14px; margin-bottom: 12px; }
+    .valor { font-weight: 700; overflow-wrap: anywhere; }
+    .peso { font-size: clamp(38px, 8vw, 54px); letter-spacing: -1px; }
+    .unidad { font-size: 19px; color: #617181; font-weight: 600; }
+    .estado { font-size: 25px; }
+    .detalle { color: #617181; font-size: 13px; margin-top: 8px; }
+    .pildora {
+      display: inline-block; padding: 8px 12px; border-radius: 999px;
+      background: #edf1f4; color: #465565; font-size: 14px; font-weight: 700;
+    }
+    .ok { background: #e2f5e9; color: #176b38; }
+    .alerta { background: #fff0d9; color: #885400; }
+    .apagado { background: #edf1f4; color: #465565; }
+    footer { text-align: center; color: #71808d; font-size: 12px; margin: 18px 0 4px; }
+    @media (max-width: 480px) { body { padding: 14px; } .tarjeta { padding: 18px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>COMEDERO INTELIGENTE</h1>
+    <div class="subtitulo">Monitoreo local del alimento y la actividad</div>
+  </header>
+
+  <section class="rejilla">
+    <article class="tarjeta">
+      <div class="etiqueta">Peso del alimento</div>
+      <div><span id="peso" class="valor peso">0.00</span> <span class="unidad">kg</span></div>
+      <div id="pesoGramos" class="detalle">0.00 g</div>
+    </article>
+
+    <article class="tarjeta">
+      <div class="etiqueta">Estado del animal</div>
+      <div id="estadoAnimal" class="valor estado">NO COMIENDO</div>
+      <div class="detalle">Identificación RFID</div>
+      <div id="uid" class="valor">Sin tarjeta detectada</div>
+    </article>
+
+    <article class="tarjeta">
+      <div class="etiqueta">Compuerta</div>
+      <div id="estadoCompuerta" class="pildora apagado">CERRADA</div>
+      <div id="detalleCompuerta" class="detalle">Control automático activo</div>
+    </article>
+
+    <article class="tarjeta">
+      <div class="etiqueta">Control de reposición</div>
+      <div id="estadoReposicion" class="valor">Peso por encima del límite</div>
+      <div id="tiempoReposicion" class="detalle">Apertura al bajar de 500 g durante 4 segundos</div>
+    </article>
+  </section>
+
+  <footer>Red Wi-Fi local: ESP32_PROYECTO · Actualización automática</footer>
+</main>
+
+<script>
+async function actualizar() {
+  try {
+    const respuesta = await fetch('/estado', { cache: 'no-store' });
+    if (!respuesta.ok) throw new Error('Respuesta HTTP ' + respuesta.status);
+    const d = await respuesta.json();
+
+    document.getElementById('peso').textContent = Number(d.peso_kg).toFixed(2);
+    document.getElementById('pesoGramos').textContent = Number(d.peso_g).toFixed(2) + ' g';
+
+    document.getElementById('uid').textContent = d.uid || 'Sin tarjeta detectada';
+    const estadoAnimal = document.getElementById('estadoAnimal');
+    estadoAnimal.textContent = d.comiendo ? 'COMIENDO' : 'NO COMIENDO';
+    estadoAnimal.style.color = d.comiendo ? '#176b38' : '#465565';
+
+    const estadoCompuerta = document.getElementById('estadoCompuerta');
+    estadoCompuerta.textContent = d.compuerta_abierta ? 'ABIERTA' : 'CERRADA';
+    estadoCompuerta.className = 'pildora ' + (d.compuerta_abierta ? 'ok' : 'apagado');
+    document.getElementById('detalleCompuerta').textContent = d.compuerta_abierta
+      ? 'La compuerta está permitiendo el ingreso de alimento'
+      : 'La compuerta está en posición de cierre';
+
+    const reposicion = document.getElementById('estadoReposicion');
+    const tiempo = document.getElementById('tiempoReposicion');
+    if (d.compuerta_abierta) {
+      reposicion.textContent = 'Reposición en curso';
+      tiempo.textContent = 'La compuerta se cerrará al alcanzar 550 g';
+    } else if (d.contando_peso_bajo) {
+      reposicion.textContent = 'Peso inferior a 500 g';
+      tiempo.textContent = 'Abriendo en aproximadamente ' + d.segundos_restantes + ' s';
+    } else {
+      reposicion.textContent = 'Esperando nivel bajo de alimento';
+      tiempo.textContent = 'Apertura al bajar de 500 g durante 4 segundos';
+    }
+  } catch (error) {
+    document.getElementById('estadoReposicion').textContent = 'Sin comunicación con el ESP32';
+    document.getElementById('tiempoReposicion').textContent = 'Comprobá que sigas conectado a la red del comedero';
+  }
+}
+actualizar();
+setInterval(actualizar, 1000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+void paginaPrincipal()
+{
+  server.send_P(200, "text/html; charset=utf-8", paginaWeb);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup()
+{
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\nESP32 - COMEDERO INTELIGENTE CON PAGINA WEB INTEGRADA");
+
+  servoCompuerta.setPeriodHertz(50);
+  servoCompuerta.attach(SERVO_PIN, 500, 2400);
+  servoCompuerta.write(ANGULO_CERRADO);
+  Serial.println("Servo inicializado; compuerta en posicion cerrada.");
+
+  // HX711: celda vacia durante la tara.
+  hx711.begin();
+  Serial.println("Tara: deje la celda sin carga...");
+  delay(800);
+  const int muestrasTara = 15;
+  int64_t suma = 0;
+  for (int i = 0; i < muestrasTara; i++)
+  {
+    suma += hx711.readChannelRaw(CHAN_A_GAIN_128);
+    delay(20);
+  }
+  offsetTara = (int32_t)(suma / muestrasTara);
+  Serial.print("Offset de tara: ");
+  Serial.println(offsetTara);
+  Serial.println("HX711 listo.");
+
+  // RFID
+  SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_SS);
+  rfid.PCD_Init();
+  Serial.println("RFID RC522 listo.");
+
+  // Crear la red Wi-Fi propia del comedero.
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  IPAddress ip(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(ip, gateway, subnet);
+
+  if (WiFi.softAP(ssid, password))
+  {
+    Serial.println("Punto de acceso Wi-Fi iniciado.");
+    Serial.print("Red: ");
+    Serial.println(ssid);
+    Serial.print("Contrasena: ");
+    Serial.println(password);
+    Serial.print("Abrir pagina web en: http://");
+    Serial.println(WiFi.softAPIP());
+  }
+  else
+  {
+    Serial.println("ERROR: no se pudo crear el punto de acceso Wi-Fi.");
+  }
+
+  // Configurar el servidor y la pagina web.
+  server.on("/", HTTP_GET, paginaPrincipal);
+  server.on("/estado", HTTP_GET, enviarEstado);
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Recurso no encontrado");
+  });
+  server.begin();
+  Serial.println("Servidor web iniciado.");
+  Serial.println("Conectate a ESP32_PROYECTO y abri http://192.168.4.1");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop()
+{
+  // Atender solicitudes de la pagina web sin detener sensores.
+  server.handleClient();
+
+  leerRFID();
+
+  if (comiendo && millis() - ultimaDeteccionRFID > TIEMPO_SIN_RFID)
+  {
+    comiendo = false;
+    Serial.println("Estado: NO COMIENDO (RFID ausente)");
+  }
+
+  if (millis() - ultimoPeso >= INTERVALO_PESO)
+  {
+    ultimoPeso = millis();
+    leerPeso();
+    controlarCompuerta();
+  }
+}
