@@ -1,3 +1,11 @@
+//LIBRERÍAS A INSTALAR:
+
+//Nombre que tenés que buscar	|  Autor
+
+//Adafruit HX711	            |  Adafruit
+//MFRC522	                    |  Miguel Balboa
+//ESP32Servo	                |  Kevin Harrington
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <SPI.h>
